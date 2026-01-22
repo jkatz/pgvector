@@ -184,6 +184,64 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ivfflathandler);
 Datum
 ivfflathandler(PG_FUNCTION_ARGS)
 {
+#if PG_VERSION_NUM >= 190000
+	static const IndexAmRoutine amroutine = {
+		.type = T_IndexAmRoutine,
+		.amstrategies = 0,
+		.amsupport = 5,
+		.amoptsprocnum = 0,
+		.amcanorder = false,
+		.amcanorderbyop = true,
+		.amcanhash = false,
+		.amconsistentequality = false,
+		.amconsistentordering = false,
+		.amcanbackward = false,
+		.amcanunique = false,
+		.amcanmulticol = false,
+		.amoptionalkey = true,
+		.amsearcharray = false,
+		.amsearchnulls = false,
+		.amstorage = false,
+		.amclusterable = false,
+		.ampredlocks = false,
+		.amcanparallel = false,
+		.amcanbuildparallel = true,
+		.amcaninclude = false,
+		.amusemaintenanceworkmem = false,
+		.amsummarizing = false,
+		.amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL,
+		.amkeytype = InvalidOid,
+
+		.ambuild = ivfflatbuild,
+		.ambuildempty = ivfflatbuildempty,
+		.aminsert = ivfflatinsert,
+		.aminsertcleanup = NULL,
+		.ambulkdelete = ivfflatbulkdelete,
+		.amvacuumcleanup = ivfflatvacuumcleanup,
+		.amcanreturn = NULL,
+		.amcostestimate = ivfflatcostestimate,
+		.amgettreeheight = NULL,
+		.amoptions = ivfflatoptions,
+		.amproperty = NULL,
+		.ambuildphasename = ivfflatbuildphasename,
+		.amvalidate = ivfflatvalidate,
+		.amadjustmembers = NULL,
+		.ambeginscan = ivfflatbeginscan,
+		.amrescan = ivfflatrescan,
+		.amgettuple = ivfflatgettuple,
+		.amgetbitmap = NULL,
+		.amendscan = ivfflatendscan,
+		.ammarkpos = NULL,
+		.amrestrpos = NULL,
+		.amestimateparallelscan = NULL,
+		.aminitparallelscan = NULL,
+		.amparallelrescan = NULL,
+		.amtranslatestrategy = NULL,
+		.amtranslatecmptype = NULL,
+	};
+
+	PG_RETURN_POINTER(&amroutine);
+#else
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
 	amroutine->amstrategies = 0;
@@ -257,4 +315,5 @@ ivfflathandler(PG_FUNCTION_ARGS)
 #endif
 
 	PG_RETURN_POINTER(amroutine);
+#endif
 }

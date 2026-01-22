@@ -266,6 +266,64 @@ FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnswhandler);
 Datum
 hnswhandler(PG_FUNCTION_ARGS)
 {
+#if PG_VERSION_NUM >= 190000
+	static const IndexAmRoutine amroutine = {
+		.type = T_IndexAmRoutine,
+		.amstrategies = 0,
+		.amsupport = 3,
+		.amoptsprocnum = 0,
+		.amcanorder = false,
+		.amcanorderbyop = true,
+		.amcanhash = false,
+		.amconsistentequality = false,
+		.amconsistentordering = false,
+		.amcanbackward = false,
+		.amcanunique = false,
+		.amcanmulticol = false,
+		.amoptionalkey = true,
+		.amsearcharray = false,
+		.amsearchnulls = false,
+		.amstorage = false,
+		.amclusterable = false,
+		.ampredlocks = false,
+		.amcanparallel = false,
+		.amcanbuildparallel = true,
+		.amcaninclude = false,
+		.amusemaintenanceworkmem = false,
+		.amsummarizing = false,
+		.amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL,
+		.amkeytype = InvalidOid,
+
+		.ambuild = hnswbuild,
+		.ambuildempty = hnswbuildempty,
+		.aminsert = hnswinsert,
+		.aminsertcleanup = NULL,
+		.ambulkdelete = hnswbulkdelete,
+		.amvacuumcleanup = hnswvacuumcleanup,
+		.amcanreturn = NULL,
+		.amcostestimate = hnswcostestimate,
+		.amgettreeheight = NULL,
+		.amoptions = hnswoptions,
+		.amproperty = NULL,
+		.ambuildphasename = hnswbuildphasename,
+		.amvalidate = hnswvalidate,
+		.amadjustmembers = NULL,
+		.ambeginscan = hnswbeginscan,
+		.amrescan = hnswrescan,
+		.amgettuple = hnswgettuple,
+		.amgetbitmap = NULL,
+		.amendscan = hnswendscan,
+		.ammarkpos = NULL,
+		.amrestrpos = NULL,
+		.amestimateparallelscan = NULL,
+		.aminitparallelscan = NULL,
+		.amparallelrescan = NULL,
+		.amtranslatestrategy = NULL,
+		.amtranslatecmptype = NULL,
+	};
+
+	PG_RETURN_POINTER(&amroutine);
+#else
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
 	amroutine->amstrategies = 0;
@@ -339,4 +397,5 @@ hnswhandler(PG_FUNCTION_ARGS)
 #endif
 
 	PG_RETURN_POINTER(amroutine);
+#endif
 }
