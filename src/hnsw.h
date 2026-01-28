@@ -382,6 +382,12 @@ typedef struct HnswScanOpaqueData
 	Size		maxMemory;
 	MemoryContext tmpCtx;
 
+	/* Predicate filtering */
+	int			nkeys;
+	ScanKey		keys;
+	TupleDesc	indexTupdesc;
+	Relation	heapRelation;
+
 	/* Support functions */
 	HnswSupport support;
 }			HnswScanOpaqueData;
@@ -423,7 +429,7 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
 Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
 void		HnswInitPage(Buffer buf, Page page);
 void		HnswInit(void);
-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
+List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, Relation heapRel, Snapshot snapshot, ScanKey keys, int nkeys);
 HnswElement HnswGetEntryPoint(Relation index);
 void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
@@ -446,6 +452,7 @@ void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElemen
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);
 const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
+bool		HnswEvaluatePredicates(ItemPointer heaptid, Relation heapRel, Snapshot snapshot, ScanKey keys, int nkeys);
 PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
 
 /* Index access methods */

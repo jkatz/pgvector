@@ -4,7 +4,9 @@
 
 #include "access/genam.h"
 #include "access/generic_xlog.h"
+#include "access/tableam.h"
 #include "common/hashfn.h"
+#include "executor/executor.h"
 #include "fmgr.h"
 #include "hnsw.h"
 #include "lib/pairingheap.h"
@@ -666,14 +668,19 @@ CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, 
  * Init visited
  */
 static inline void
-InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
+InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m, int nkeys)
 {
+	int			visited_size;
+
+	/* Scale visited hash for predicate queries */
+	visited_size = (nkeys > 0) ? ef * m * 4 : ef * m * 2;
+
 	if (!inMemory)
-		v->tids = tidhash_create(CurrentMemoryContext, ef * m * 2, NULL);
+		v->tids = tidhash_create(CurrentMemoryContext, visited_size, NULL);
 	else if (base != NULL)
-		v->offsets = offsethash_create(CurrentMemoryContext, ef * m * 2, NULL);
+		v->offsets = offsethash_create(CurrentMemoryContext, visited_size, NULL);
 	else
-		v->pointers = pointerhash_create(CurrentMemoryContext, ef * m * 2, NULL);
+		v->pointers = pointerhash_create(CurrentMemoryContext, visited_size, NULL);
 }
 
 /*
@@ -814,10 +821,80 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 }
 
 /*
+ * Evaluate predicates for a heap tuple
+ */
+bool
+HnswEvaluatePredicates(ItemPointer heaptid, Relation heapRel, Snapshot snapshot,
+					   ScanKey keys, int nkeys)
+{
+	TupleTableSlot *slot;
+	bool		result = true;
+
+	if (nkeys == 0)
+		return true;		/* No predicates to check */
+
+	/* Create a tuple table slot for fetching */
+	slot = table_slot_create(heapRel, NULL);
+
+	/* Fetch heap tuple */
+	if (!table_tuple_fetch_row_version(heapRel, heaptid, snapshot, slot))
+	{
+		ExecDropSingleTupleTableSlot(slot);
+		return false;		/* Tuple deleted/invisible */
+	}
+
+	/* Evaluate each predicate */
+	for (int i = 0; i < nkeys; i++)
+	{
+		ScanKey		key = &keys[i];
+		Datum		datum;
+		bool		isnull;
+		Datum		test;
+
+		/* Handle NULL predicates (IS NULL checks) */
+		if (key->sk_flags & SK_ISNULL)
+		{
+			datum = slot_getattr(slot, key->sk_attno, &isnull);
+			if (!isnull)
+			{
+				result = false;
+				break;
+			}
+			continue;
+		}
+
+		/* Get attribute value from tuple slot */
+		datum = slot_getattr(slot, key->sk_attno, &isnull);
+
+		/* NULL values don't match non-NULL predicates */
+		if (isnull)
+		{
+			result = false;
+			break;
+		}
+
+		/* Call comparison function */
+		test = FunctionCall2Coll(&key->sk_func,
+								 key->sk_collation,
+								 datum,
+								 key->sk_argument);
+
+		if (!DatumGetBool(test))
+		{
+			result = false;
+			break;
+		}
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	return result;
+}
+
+/*
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, Relation heapRel, Snapshot snapshot, ScanKey keys, int nkeys)
 {
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
@@ -828,9 +905,24 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswNeighborArray *localNeighborhood = NULL;
 	Size		neighborhoodSize = 0;
 	int			lm = HnswGetLayerM(m, lc);
-	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
+	int			unvisitedSize;
+	HnswUnvisited *unvisited;
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
+
+	/* Allocate unvisited array */
+	if (nkeys > 0 && !inserting && !inMemory)
+	{
+		/* Scale with ef for predicate filtering */
+		unvisitedSize = ef * m * 2;
+
+		if (unvisitedSize > 10000)
+			unvisitedSize = 10000;
+	}
+	else
+		unvisitedSize = lm;
+
+	unvisited = palloc(unvisitedSize * sizeof(HnswUnvisited));
 
 	if (v == NULL)
 	{
@@ -840,7 +932,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 	if (initVisited)
 	{
-		InitVisited(base, v, inMemory, ef, m);
+		InitVisited(base, v, inMemory, ef, m, nkeys);
 
 		if (discarded != NULL)
 			*discarded = pairingheap_allocate(CompareNearestDiscardedCandidates, NULL);
@@ -880,14 +972,29 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			wlen++;
 	}
 
+	/* Track total candidates examined for predicate filtering */
+	int			candidates_examined = list_length(ep);
+
 	while (!pairingheap_is_empty(C))
 	{
 		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
 		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 		HnswElement cElement;
 
+		/*
+		 * For predicate queries, continue searching until enough candidates
+		 * examined to compensate for filtering
+		 */
 		if (c->distance > f->distance)
-			break;
+		{
+			if (nkeys == 0)
+				break;
+
+			if (candidates_examined >= ef)
+				break;
+		}
+
+		candidates_examined++;
 
 		cElement = HnswPtrAccess(base, c->element);
 
@@ -895,6 +1002,42 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
 		else
 			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+
+		/* Expand neighbors for predicate filtering (2-hop) */
+		if (nkeys > 0 && !inserting && !inMemory)
+		{
+			int			firstHopCount = unvisitedLength;
+
+			for (int i = 0; i < firstHopCount && unvisitedLength < unvisitedSize; i++)
+			{
+				ItemPointer firstHopTid = &unvisited[i].indextid;
+				HnswElement firstHopElement;
+				ItemPointerData secondHopTids[HNSW_MAX_M * 2];
+
+				firstHopElement = HnswInitElementFromBlock(
+					ItemPointerGetBlockNumber(firstHopTid),
+					ItemPointerGetOffsetNumber(firstHopTid));
+
+				if (HnswLoadNeighborTids(firstHopElement, secondHopTids, index, m, lm, lc))
+				{
+					for (int j = 0; j < lm && unvisitedLength < unvisitedSize; j++)
+					{
+						ItemPointer secondHopTid = &secondHopTids[j];
+						bool		found;
+
+						if (!ItemPointerIsValid(secondHopTid))
+							break;
+
+						tidhash_insert(v->tids, *secondHopTid, &found);
+
+						if (!found)
+							unvisited[unvisitedLength++].indextid = *secondHopTid;
+					}
+				}
+
+				pfree(firstHopElement);
+			}
+		}
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
@@ -1300,7 +1443,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, InvalidSnapshot, NULL, 0);
 		ep = w;
 	}
 
@@ -1319,7 +1462,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 		List	   *lw = NIL;
 		ListCell   *lc2;
 
-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL, InvalidSnapshot, NULL, 0);
 
 		/* Convert search candidates to candidates */
 		foreach(lc2, w)

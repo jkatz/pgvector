@@ -46,11 +46,22 @@ GetScanItems(IndexScanDesc scan, Datum value)
 
 	for (int lc = entryPoint->level; lc >= 1; lc--)
 	{
-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
+		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, NULL, InvalidSnapshot, NULL, 0);
 		ep = w;
 	}
 
-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
+	/* Adjust ef for predicate filtering */
+	int			adjusted_ef = hnsw_ef_search;
+
+	if (so->nkeys > 0)
+	{
+		adjusted_ef = hnsw_ef_search * 4;
+
+		if (adjusted_ef > 1000)
+			adjusted_ef = 1000;
+	}
+
+	return HnswSearchLayer(base, q, ep, adjusted_ef, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, so->heapRelation, scan->xs_snapshot, so->keys, so->nkeys);
 }
 
 /*
@@ -81,7 +92,7 @@ ResumeScanItems(IndexScanDesc scan)
 		ep = lappend(ep, sc);
 	}
 
-	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
+	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, so->heapRelation, scan->xs_snapshot, so->keys, so->nkeys);
 }
 
 /*
@@ -140,6 +151,12 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 	/* Set support functions */
 	HnswInitSupport(&so->support, index);
 
+	/* Store index metadata for predicate filtering */
+	so->indexTupdesc = RelationGetDescr(index);
+	so->nkeys = 0;
+	so->keys = NULL;
+	so->heapRelation = NULL;
+
 	/*
 	 * Use a lower max allocation size than default to allow scanning more
 	 * tuples for iterative search before exceeding work_mem
@@ -172,6 +189,12 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->discarded = NULL;
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
+
+	/* Store predicate information */
+	so->nkeys = nkeys;
+	so->keys = scan->keyData;
+	so->heapRelation = scan->heapRelation;
+
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
@@ -307,6 +330,14 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		}
 
 		heaptid = &element->heaptids[--element->heaptidsLength];
+
+		/* Filter by predicates */
+		if (so->nkeys > 0)
+		{
+			if (!HnswEvaluatePredicates(heaptid, so->heapRelation,
+										 scan->xs_snapshot, so->keys, so->nkeys))
+				continue;
+		}
 
 		if (hnsw_iterative_scan == HNSW_ITERATIVE_SCAN_STRICT)
 		{
