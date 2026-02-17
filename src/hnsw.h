@@ -262,6 +262,7 @@ typedef struct HnswSupport
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
+	double		(*earlyAbortDistance)(Datum query, Datum candidate, double maxDistance);
 }			HnswSupport;
 
 typedef struct HnswQuery

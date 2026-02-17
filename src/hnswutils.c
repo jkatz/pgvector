@@ -15,7 +15,25 @@
 #include "utils/datum.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
+#include "halfvec.h"
+#include "halfutils.h"
 #include "vector.h"
+
+/* Distance functions for early abort dispatch */
+extern Datum vector_l2_squared_distance(PG_FUNCTION_ARGS);
+extern Datum vector_negative_inner_product(PG_FUNCTION_ARGS);
+extern Datum l1_distance(PG_FUNCTION_ARGS);
+extern Datum halfvec_l2_squared_distance(PG_FUNCTION_ARGS);
+extern Datum halfvec_negative_inner_product(PG_FUNCTION_ARGS);
+extern Datum halfvec_l1_distance(PG_FUNCTION_ARGS);
+
+/* Early abort distance functions */
+static double HnswVectorL2EarlyAbort(Datum query, Datum candidate, double maxDistance);
+static double HnswVectorCosineEarlyAbort(Datum query, Datum candidate, double maxDistance);
+static double HnswVectorL1EarlyAbort(Datum query, Datum candidate, double maxDistance);
+static double HnswHalfvecL2EarlyAbort(Datum query, Datum candidate, double maxDistance);
+static double HnswHalfvecCosineEarlyAbort(Datum query, Datum candidate, double maxDistance);
+static double HnswHalfvecL1EarlyAbort(Datum query, Datum candidate, double maxDistance);
 
 #if PG_VERSION_NUM >= 160000
 #include "varatt.h"
@@ -152,9 +170,28 @@ HnswOptionalProcInfo(Relation index, uint16 procnum)
 void
 HnswInitSupport(HnswSupport * support, Relation index)
 {
+	PGFunction	fn;
+
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+
+	/* Dispatch early abort function for monotonic distance metrics */
+	support->earlyAbortDistance = NULL;
+	fn = support->procinfo->fn_addr;
+
+	if (fn == vector_l2_squared_distance)
+		support->earlyAbortDistance = HnswVectorL2EarlyAbort;
+	else if (fn == vector_negative_inner_product && support->normprocinfo != NULL)
+		support->earlyAbortDistance = HnswVectorCosineEarlyAbort;
+	else if (fn == l1_distance)
+		support->earlyAbortDistance = HnswVectorL1EarlyAbort;
+	else if (fn == halfvec_l2_squared_distance)
+		support->earlyAbortDistance = HnswHalfvecL2EarlyAbort;
+	else if (fn == halfvec_negative_inner_product && support->normprocinfo != NULL)
+		support->earlyAbortDistance = HnswHalfvecCosineEarlyAbort;
+	else if (fn == halfvec_l1_distance)
+		support->earlyAbortDistance = HnswHalfvecL1EarlyAbort;
 }
 
 /*
@@ -519,6 +556,366 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 }
 
 /*
+ * Early abort L2 squared distance for vector
+ */
+static double
+HnswVectorL2EarlyAbort(Datum query, Datum candidate, double maxDistance)
+{
+	Vector	   *a = DatumGetVector(query);
+	Vector	   *b = (Vector *) DatumGetPointer(candidate);
+	int			dim = a->dim;
+	float	   *ax = a->x;
+	float	   *bx = b->x;
+	float		distance = 0.0;
+	float		threshold = (float) maxDistance;
+	int			quarter;
+	int			i;
+
+	if (dim < 128)
+	{
+		for (i = 0; i < dim; i++)
+		{
+			float		diff = ax[i] - bx[i];
+
+			distance += diff * diff;
+		}
+		return (double) distance;
+	}
+
+	quarter = dim / 4;
+
+	for (i = 0; i < quarter; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < 2 * quarter; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < 3 * quarter; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < dim; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+
+	return (double) distance;
+}
+
+/*
+ * Early abort cosine distance for vector (via L2 squared on normalized vectors)
+ */
+static double
+HnswVectorCosineEarlyAbort(Datum query, Datum candidate, double maxDistance)
+{
+	Vector	   *a = DatumGetVector(query);
+	Vector	   *b = (Vector *) DatumGetPointer(candidate);
+	int			dim = a->dim;
+	float	   *ax = a->x;
+	float	   *bx = b->x;
+	float		distance = 0.0;
+	/* Convert neg_ip threshold to L2 squared: L2sq = 2 * neg_ip + 2 */
+	float		threshold = (float) (2.0 * maxDistance + 2.0);
+	int			quarter;
+	int			i;
+
+	if (dim < 128)
+	{
+		for (i = 0; i < dim; i++)
+		{
+			float		diff = ax[i] - bx[i];
+
+			distance += diff * diff;
+		}
+		return ((double) distance - 2.0) / 2.0;
+	}
+
+	quarter = dim / 4;
+
+	for (i = 0; i < quarter; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return maxDistance;
+
+	for (; i < 2 * quarter; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return maxDistance;
+
+	for (; i < 3 * quarter; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return maxDistance;
+
+	for (; i < dim; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+
+	/* Convert L2 squared to negative inner product */
+	return ((double) distance - 2.0) / 2.0;
+}
+
+/*
+ * Early abort L1 distance for vector
+ */
+static double
+HnswVectorL1EarlyAbort(Datum query, Datum candidate, double maxDistance)
+{
+	Vector	   *a = DatumGetVector(query);
+	Vector	   *b = (Vector *) DatumGetPointer(candidate);
+	int			dim = a->dim;
+	float	   *ax = a->x;
+	float	   *bx = b->x;
+	float		distance = 0.0;
+	float		threshold = (float) maxDistance;
+	int			quarter;
+	int			i;
+
+	if (dim < 128)
+	{
+		for (i = 0; i < dim; i++)
+			distance += fabsf(ax[i] - bx[i]);
+		return (double) distance;
+	}
+
+	quarter = dim / 4;
+
+	for (i = 0; i < quarter; i++)
+		distance += fabsf(ax[i] - bx[i]);
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < 2 * quarter; i++)
+		distance += fabsf(ax[i] - bx[i]);
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < 3 * quarter; i++)
+		distance += fabsf(ax[i] - bx[i]);
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < dim; i++)
+		distance += fabsf(ax[i] - bx[i]);
+
+	return (double) distance;
+}
+
+/*
+ * Early abort L2 squared distance for halfvec
+ */
+static double
+HnswHalfvecL2EarlyAbort(Datum query, Datum candidate, double maxDistance)
+{
+	HalfVector *a = DatumGetHalfVector(query);
+	HalfVector *b = (HalfVector *) DatumGetPointer(candidate);
+	int			dim = a->dim;
+	half	   *ax = a->x;
+	half	   *bx = b->x;
+	float		distance = 0.0;
+	float		threshold = (float) maxDistance;
+	int			quarter;
+	int			i;
+
+	if (dim < 128)
+	{
+		for (i = 0; i < dim; i++)
+		{
+			float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+			distance += diff * diff;
+		}
+		return (double) distance;
+	}
+
+	quarter = dim / 4;
+
+	for (i = 0; i < quarter; i++)
+	{
+		float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < 2 * quarter; i++)
+	{
+		float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < 3 * quarter; i++)
+	{
+		float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < dim; i++)
+	{
+		float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+
+	return (double) distance;
+}
+
+/*
+ * Early abort cosine distance for halfvec (via L2 squared on normalized vectors)
+ */
+static double
+HnswHalfvecCosineEarlyAbort(Datum query, Datum candidate, double maxDistance)
+{
+	HalfVector *a = DatumGetHalfVector(query);
+	HalfVector *b = (HalfVector *) DatumGetPointer(candidate);
+	int			dim = a->dim;
+	half	   *ax = a->x;
+	half	   *bx = b->x;
+	float		distance = 0.0;
+	/* Convert neg_ip threshold to L2 squared: L2sq = 2 * neg_ip + 2 */
+	float		threshold = (float) (2.0 * maxDistance + 2.0);
+	int			quarter;
+	int			i;
+
+	if (dim < 128)
+	{
+		for (i = 0; i < dim; i++)
+		{
+			float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+			distance += diff * diff;
+		}
+		return ((double) distance - 2.0) / 2.0;
+	}
+
+	quarter = dim / 4;
+
+	for (i = 0; i < quarter; i++)
+	{
+		float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return maxDistance;
+
+	for (; i < 2 * quarter; i++)
+	{
+		float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return maxDistance;
+
+	for (; i < 3 * quarter; i++)
+	{
+		float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+	if (distance > threshold)
+		return maxDistance;
+
+	for (; i < dim; i++)
+	{
+		float		diff = HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]);
+
+		distance += diff * diff;
+	}
+
+	/* Convert L2 squared to negative inner product */
+	return ((double) distance - 2.0) / 2.0;
+}
+
+/*
+ * Early abort L1 distance for halfvec
+ */
+static double
+HnswHalfvecL1EarlyAbort(Datum query, Datum candidate, double maxDistance)
+{
+	HalfVector *a = DatumGetHalfVector(query);
+	HalfVector *b = (HalfVector *) DatumGetPointer(candidate);
+	int			dim = a->dim;
+	half	   *ax = a->x;
+	half	   *bx = b->x;
+	float		distance = 0.0;
+	float		threshold = (float) maxDistance;
+	int			quarter;
+	int			i;
+
+	if (dim < 128)
+	{
+		for (i = 0; i < dim; i++)
+			distance += fabsf(HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]));
+		return (double) distance;
+	}
+
+	quarter = dim / 4;
+
+	for (i = 0; i < quarter; i++)
+		distance += fabsf(HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]));
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < 2 * quarter; i++)
+		distance += fabsf(HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]));
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < 3 * quarter; i++)
+		distance += fabsf(HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]));
+	if (distance > threshold)
+		return (double) distance;
+
+	for (; i < dim; i++)
+		distance += fabsf(HalfToFloat4(ax[i]) - HalfToFloat4(bx[i]));
+
+	return (double) distance;
+}
+
+/*
  * Calculate the distance between values
  */
 static inline double
@@ -551,6 +948,10 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	{
 		if (DatumGetPointer(q->value) == NULL)
 			*distance = 0;
+		else if (!loadVec && maxDistance != NULL &&
+				 support->earlyAbortDistance != NULL)
+			*distance = support->earlyAbortDistance(q->value,
+												   PointerGetDatum(&etup->data), *maxDistance);
 		else
 			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
 	}
